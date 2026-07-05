@@ -1,4 +1,6 @@
-name: Ultimate VPN Subscriber (Fixed Parsing)
+# Stabilized workflow: reduced test set and concurrency, longer timeouts, no git push
+
+name: Ultimate VPN Subscriber (Stabilized)
 
 on:
   schedule:
@@ -14,12 +16,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Massive Fetch & Filter (Fixed)
+      - name: Massive Fetch & Filter (Stabilized)
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "⏳ 启动大规模抓取..."
+          echo "⏳ 启动大规模抓取（稳健模式）..."
           TMP=$(mktemp -d)
           cd "$TMP"
           > raw.txt
@@ -48,7 +50,7 @@ jobs:
 
           for url in "${SOURCES[@]}"; do
             echo "⬇️  抓取: $url"
-            content=$(curl -sL --connect-timeout 10 "$url" 2>/dev/null | gunzip -c 2>/dev/null || curl -sL --connect-timeout 10 "$url" 2>/dev/null || true)
+            content=$(curl -sL --connect-timeout 15 "$url" 2>/dev/null | gunzip -c 2>/dev/null || curl -sL --connect-timeout 15 "$url" 2>/dev/null || true)
             if [ -z "${content:-}" ]; then
               echo "   ⚠️  空或失败，跳过"
               continue
@@ -68,10 +70,11 @@ jobs:
             exit 0
           fi
 
-          N=300
+          # reduced test size to speed up and increase stability
+          N=150
           head -n "${N}" uniq.txt > to_test.txt
 
-          echo "🔍 开始智能解析 + 连通性检测..."
+          echo "🔍 开始智能解析 + 连通性检测（并发 5，超时 3s）..."
           > ok.txt
 
           detect() {
@@ -88,11 +91,7 @@ jobs:
 
             if [ "$scheme" = "vmess" ]; then
               if [[ "$payload" =~ @([^:\/]+):([0-9]+)$ ]] || [[ "$payload" =~ ([^:\/]+):([0-9]+)$ ]]; then
-                if [[ "$payload" =~ @([^:\/]+):([0-9]+)$ ]]; then
-                  host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
-                else
-                  host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
-                fi
+                host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
               else
                 safe=$(echo "$payload" | tr '_-' '+/')
                 pad=$(( 4 - (${#safe} % 4) ))
@@ -138,14 +137,15 @@ except:
             fi
 
             if [ -n "${host:-}" ] && [ -n "${port:-}" ]; then
-              if timeout 2 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
+              if timeout 3 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
                 echo "$node"
               fi
             fi
           }
           export -f detect
 
-          cat to_test.txt | xargs -P 10 -I {} bash -c 'detect "$@"' _ {} > ok.txt 2>/dev/null || true
+          # reduced concurrency to avoid network issues
+          cat to_test.txt | xargs -P 5 -I {} bash -c 'detect "$@"' _ {} > ok.txt 2>/dev/null || true
 
           available=$(wc -l < ok.txt || echo 0)
           echo "✅ 通过检测的可用节点数: ${available}"
@@ -158,28 +158,14 @@ except:
             base64 -w 0 ok.txt > ../sub.txt
             echo "🎉 使用 ${available} 个经过检测的节点"
           else
-            echo "⚠️ 无节点通过检测，使用去重后的前 200 条作为回退"
-            head -n 200 uniq.txt > fallback.txt
+            echo "⚠️ 无节点通过检测，使用去重后的前 100 条作为回退"
+            head -n 100 uniq.txt > fallback.txt
             base64 -w 0 fallback.txt > ../sub.txt
           fi
 
           cd ..
           rm -rf "$TMP"
           echo "✅ 订阅生成完成。"
-
-      - name: Commit & Push
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -s sub.txt ] && [ "$(head -c 20 sub.txt 2>/dev/null || true)" != "No nodes available" ]; then
-            git add sub.txt
-            git commit -m "Deploy final fixed workflow: support vmess parsing & debug artifacts" || echo "No changes"
-            git push
-            echo "✅ 推送成功"
-          else
-            echo "⏭️ 跳过提交"
-          fi
 
       - name: Upload debug artifacts
         uses: actions/upload-artifact@v4
@@ -189,3 +175,5 @@ except:
             sub.txt
             ok.txt
             uniq.txt
+
+      # Note: Commit & Push removed to avoid failures due to branch protections or GITHUB_TOKEN restrictions.
