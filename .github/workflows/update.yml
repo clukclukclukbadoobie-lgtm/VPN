@@ -1,0 +1,76 @@
+name: Update Free Nodes
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # 每小时更新一次
+  workflow_dispatch:       # 允许手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch and filter nodes
+        run: |
+          # 安装依赖
+          sudo apt-get update && sudo apt-get install -y curl jq netcat-openbsd
+
+          # 创建临时目录
+          mkdir -p tmp
+          > tmp/all.txt
+
+          # 定义订阅源（和之前的脚本一致）
+          sources=(
+            "https://raw.githubusercontent.com/Au1rxx/free-vpn-subscriptions/main/v2ray.txt"
+            "https://raw.githubusercontent.com/Ruk1ng001/freeSub/main/v2ray"
+            "https://raw.githubusercontent.com/victorgeel/keybot/main/subscription/working_keys.txt"
+            "https://raw.githubusercontent.com/miladtahanian/Config-Collector/main/mixed_iran.txt"
+            "https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/Eternity.txt"
+            "https://raw.githubusercontent.com/pojiezhiyuanjun/freev2/master/0811.txt"
+            "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2ray"
+            "https://raw.githubusercontent.com/adiwzx/freenode/main/ssr/v2ray"
+          )
+
+          for url in "${sources[@]}"; do
+            content=$(curl -sL --connect-timeout 10 "$url" | gunzip -c 2>/dev/null || curl -sL --connect-timeout 10 "$url")
+            [ -z "$content" ] && continue
+            decoded=$(echo "$content" | base64 -d 2>/dev/null || echo "$content")
+            echo "$decoded" | grep -Eo '(vmess|vless|trojan|ss)://[^[:space:]]+' >> tmp/all.txt
+          done
+
+          # 去重
+          sort -u tmp/all.txt -o tmp/uniq.txt
+
+          # 端口检测（只测 TCP 连通性）
+          > tmp/ok.txt
+          while IFS= read -r node; do
+            if [[ "$node" =~ (vmess|vless|trojan)://([^@]+@)?([^:]+):([0-9]+) ]]; then
+              host="${BASH_REMATCH[3]}"; port="${BASH_REMATCH[4]}"
+            elif [[ "$node" =~ ss://([^@]+)@([^:]+):([0-9]+) ]]; then
+              host="${BASH_REMATCH[2]}"; port="${BASH_REMATCH[3]}"
+            else
+              continue
+            fi
+            if nc -zv -w 2 "$host" "$port" 2>/dev/null; then
+              echo "$node" >> tmp/ok.txt
+            fi
+          done < tmp/uniq.txt
+
+          # 生成 Base64 编码的订阅内容（V2RayNG 标准）
+          if [ -s tmp/ok.txt ]; then
+            base64 -w 0 tmp/ok.txt > sub.txt
+          else
+            echo "No valid nodes found." > sub.txt
+          fi
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sub.txt
+          git commit -m "Auto update nodes $(date +'%Y-%m-%d %H:%M')" || exit 0
+          git push
