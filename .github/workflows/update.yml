@@ -14,8 +14,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Massive Fetch & Filter
+        shell: bash
         run: |
-          set +e  # 容错模式
+          set -euo pipefail
 
           echo "⏳ 启动大规模抓取（连吃带拿模式）..."
           TMP=$(mktemp -d)
@@ -24,7 +25,6 @@ jobs:
 
           # ================ 超级源列表（超过25个） ================
           SOURCES=(
-            # 原基础源
             "https://raw.githubusercontent.com/Au1rxx/free-vpn-subscriptions/main/v2ray.txt"
             "https://raw.githubusercontent.com/Ruk1ng001/freeSub/main/v2ray"
             "https://raw.githubusercontent.com/victorgeel/keybot/main/subscription/working_keys.txt"
@@ -35,7 +35,6 @@ jobs:
             "https://raw.githubusercontent.com/adiwzx/freenode/main/ssr/v2ray"
             "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt"
             "https://raw.githubusercontent.com/freefq/free/master/v2ray"
-            # 新增更多源
             "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/All_Configs_Sub.txt"
             "https://raw.githubusercontent.com/ssrsub/ssr/master/ssr-sub"
             "https://raw.githubusercontent.com/Leon406/SubCrawler/master/sub/share/v2ray.txt"
@@ -54,22 +53,22 @@ jobs:
           # 抓取循环
           for url in "${SOURCES[@]}"; do
             echo "⬇️  抓取: $url"
-            content=$(curl -sL --connect-timeout 10 "$url" 2>/dev/null | gunzip -c 2>/dev/null || curl -sL --connect-timeout 10 "$url" 2>/dev/null)
-            if [ -z "$content" ]; then
+            content=$(curl -sL --connect-timeout 10 "$url" 2>/dev/null | gunzip -c 2>/dev/null || curl -sL --connect-timeout 10 "$url" 2>/dev/null || true)
+            if [ -z "${content:-}" ]; then
               echo "   ⚠️  空或失败，跳过"
               continue
             fi
             decoded=$(echo "$content" | base64 -d 2>/dev/null || echo "$content")
-            echo "$decoded" | grep -Eo '(vmess|vless|trojan|ss)://[^[:space:]]+' >> raw.txt 2>/dev/null
+            echo "$decoded" | grep -Eo '(vmess|vless|trojan|ss)://[^[:space:]]+' >> raw.txt 2>/dev/null || true
             echo "   ✅ 成功"
           done
 
           # 去重
-          sort -u raw.txt -o uniq.txt
-          total=$(wc -l < uniq.txt)
-          echo "📊 去重后总节点数: $total"
+          sort -u raw.txt -o uniq.txt || true
+          total=$(wc -l < uniq.txt || echo 0)
+          echo "📊 去重后总节点数: ${total}"
 
-          if [ "$total" -eq 0 ]; then
+          if [ "${total}" -eq 0 ]; then
             echo "❌ 无节点，生成占位符"
             echo "No nodes available." > ../sub.txt
             cd ..
@@ -77,29 +76,32 @@ jobs:
             exit 0
           fi
 
-          # 并行端口检测（20并发）
-          echo "🔍 开始高速连通性检测（并发20）..."
+          # 并行端口检测（并发 10）
+          echo "🔍 开始连通性检测（并发 10，超时 2s）..."
           > ok.txt
           detect() {
             node="$1"
             if [[ "$node" =~ (vmess|vless|trojan)://([^@]+@)?([^:]+):([0-9]+) ]]; then
               host="${BASH_REMATCH[3]}"; port="${BASH_REMATCH[4]}"
-            elif [[ "$node" =~ ss://([A-Za-z0-9_-]+)@([^:]+):([0-9]+) ]]; then
+            elif [[ "$node" =~ ss://([A-Za-z0-9_+=/-]+)@([^:]+):([0-9]+) ]]; then
               host="${BASH_REMATCH[2]}"; port="${BASH_REMATCH[3]}"
             elif [[ "$node" =~ ss://([^@]+)@([^:]+):([0-9]+) ]]; then
               host="${BASH_REMATCH[2]}"; port="${BASH_REMATCH[3]}"
             else
               return 1
             fi
-            timeout 1.5 bash -c "echo >/dev/tcp/$host/$port" 2>/dev/null && echo "$node"
+            if timeout 2 bash -c "echo >/dev/tcp/$host/$port" 2>/dev/null; then
+              echo "$node"
+            fi
           }
-          export -f detect
-          cat uniq.txt | xargs -P 20 -I {} bash -c 'detect "$@"' _ {} > ok.txt 2>/dev/null
-          available=$(wc -l < ok.txt)
-          echo "✅ 可用节点数: $available"
+          export -f detect || true
+
+          cat uniq.txt | xargs -P 10 -I {} bash -c 'detect "$@"' _ {} > ok.txt 2>/dev/null || true
+          available=$(wc -l < ok.txt || echo 0)
+          echo "✅ 可用节点数: ${available}"
 
           # 生成订阅
-          if [ "$available" -gt 0 ]; then
+          if [ "${available}" -gt 0 ]; then
             base64 -w 0 ok.txt > ../sub.txt
             echo "🎉 使用 ${available} 个经过检测的节点"
           else
@@ -112,10 +114,11 @@ jobs:
           echo "✅ 订阅生成完成。"
 
       - name: Commit & Push
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -s sub.txt ] && [ "$(head -c 20 sub.txt)" != "No nodes available" ]; then
+          if [ -s sub.txt ] && [ "$(head -c 20 sub.txt 2>/dev/null || true)" != "No nodes available" ]; then
             git add sub.txt
             git commit -m "Massive update $(date -u +'%Y-%m-%d %H:%M UTC')" || echo "No changes"
             git push
