@@ -1,0 +1,295 @@
+name: Ultimate VPN Subscriber (Full Screening)
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      MAX_DETECT: 800
+      TCP_TIMEOUT: 1.5
+      TCP_CONCURRENCY: 20
+      PING_CONCURRENCY: 10
+      PING_COUNT: 2
+      PING_WAIT: 1
+      SPEED_TOP: 300
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Full Fetch, Detect, Speed Test & Merge
+        shell: bash
+        run: |
+          # tolerant mode: handle errors per-command to avoid whole-job failure
+          set +euo pipefail
+          echo "⏳ 启动终极筛选流程（全量检测 + 测速 + 只增不减）..."
+
+          TMP=$(mktemp -d "$GITHUB_WORKSPACE/tmp.XXXX") || TMP="$GITHUB_WORKSPACE/tmp"
+          cd "$TMP" || exit 1
+          > raw.txt
+
+          # ================ 订阅源列表（25+，可按需增减） ================
+          SOURCES=(
+            "https://raw.githubusercontent.com/Au1rxx/free-vpn-subscriptions/main/v2ray.txt"
+            "https://raw.githubusercontent.com/Ruk1ng001/freeSub/main/v2ray"
+            "https://raw.githubusercontent.com/victorgeel/keybot/main/subscription/working_keys.txt"
+            "https://raw.githubusercontent.com/miladtahanian/Config-Collector/main/mixed_iran.txt"
+            "https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/Eternity.txt"
+            "https://raw.githubusercontent.com/pojiezhiyuanjun/freev2/master/0811.txt"
+            "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2ray"
+            "https://raw.githubusercontent.com/adiwzx/freenode/main/ssr/v2ray"
+            "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt"
+            "https://raw.githubusercontent.com/freefq/free/master/v2ray"
+            "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/All_Configs_Sub.txt"
+            "https://raw.githubusercontent.com/Leon406/SubCrawler/master/sub/share/v2ray.txt"
+            "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
+            "https://raw.githubusercontent.com/ripaojiedian/freenode/main/v2ray"
+            "https://raw.githubusercontent.com/colatiger/v2ray-nodes/master/v2ray.txt"
+            "https://raw.githubusercontent.com/Azumi67/Random-VPN/main/v2ray.txt"
+            "https://raw.githubusercontent.com/yebekhe/TelegramV2rayCollector/main/subs/v2ray"
+            "https://raw.githubusercontent.com/alanbobs999/TopFreeProxies/master/Eternity"
+            "https://raw.githubusercontent.com/linhlinhlinh/v2ray/master/v2ray.txt"
+          )
+
+          fetched=0
+          for url in "${SOURCES[@]}"; do
+            echo "⬇️  抓取: $url"
+            # try gzipped or plain
+            content=$(curl -sL --connect-timeout 10 "$url" 2>/dev/null | gunzip -c 2>/dev/null || curl -sL --connect-timeout 10 "$url" 2>/dev/null || true)
+            if [ -z "${content:-}" ]; then
+              echo "   ⚠️  空或失败，跳过"
+              continue
+            fi
+            # some sources are already base64 encoded lists -> try decode, else use as-is
+            decoded=$(echo "$content" | base64 -d 2>/dev/null || true)
+            if [ -n "${decoded:-}" ]; then
+              payload="$decoded"
+            else
+              payload="$content"
+            fi
+            echo "$payload" | grep -Eo '(vmess|vless|trojan|ss)://[^[:space:]]+' >> raw.txt 2>/dev/null || true
+            fetched=$((fetched+1))
+            echo "   ✅ 成功"
+          done
+
+          # 去重
+          sort -u raw.txt -o uniq.txt || true
+          total=$(wc -l < uniq.txt 2>/dev/null || echo 0)
+          echo "📊 抓取源成功数: $fetched；去重后总节点数: $total"
+
+          if [ "${total}" -eq 0 ]; then
+            echo "No nodes fetched. Keep previous sub.txt if exists."
+            cd "$GITHUB_WORKSPACE" || true
+            rm -rf "$TMP"
+            exit 0
+          fi
+
+          # 获取历史节点（如果存在）
+          EXISTING="$GITHUB_WORKSPACE/sub.txt"
+          if [ -f "$EXISTING" ]; then
+            base64 -d "$EXISTING" 2>/dev/null > existing.txt || > existing.txt
+          else
+            > existing.txt
+          fi
+
+          # 合并历史 + 新
+          cat existing.txt uniq.txt | sort -u > merged.txt || true
+          merged_count=$(wc -l < merged.txt 2>/dev/null || echo 0)
+          echo "🔄 合并后总节点数（含历史）: $merged_count"
+
+          # 限制检测数量（最大 MAX_DETECT）
+          head -n ${MAX_DETECT} merged.txt > to_detect.txt || true
+          detect_count=$(wc -l < to_detect.txt 2>/dev/null || echo 0)
+          echo "🔢 本次将检测的节点数: $detect_count"
+
+          # 智能解析 + 端口连通性检测
+          echo "🔍 开始端口连通性检测（并发 ${TCP_CONCURRENCY}，超时 ${TCP_TIMEOUT}s）..."
+          > ok.txt
+
+          detect() {
+            node="$1"
+            host=""
+            port=""
+
+            # vmess:// 处理（更宽松匹配）
+            if [[ "$node" =~ ^vmess://(.+)$ ]]; then
+              payload="${BASH_REMATCH[1]}"
+              # make URL-safe Base64 standard
+              safe=$(echo "$payload" | tr '-_' '+/')
+              pad=$(( ${#safe} % 4 ))
+              if [ $pad -ne 0 ]; then
+                safe="${safe}$(printf '=%.0s' $(seq 1 $((4-pad))))"
+              fi
+              decoded=$(echo "$safe" | base64 -d 2>/dev/null || true)
+              if [ -n "${decoded:-}" ]; then
+                host=$(echo "$decoded" | python3 -c "import sys,json
+try:
+  d=json.load(sys.stdin)
+  print(d.get('add') or d.get('address') or d.get('host') or '')
+except:
+  print('')" 2>/dev/null || true)
+                port=$(echo "$decoded" | python3 -c "import sys,json
+try:
+  d=json.load(sys.stdin)
+  print(d.get('port') or '')
+except:
+  print('')" 2>/dev/null || true)
+              fi
+            fi
+
+            # ss:// 支持多种格式
+            if [[ -z "${host:-}" ]]; then
+              if [[ "$node" =~ ^ss://([^@]+)@([^:]+):([0-9]+) ]]; then
+                host="${BASH_REMATCH[2]}"; port="${BASH_REMATCH[3]}"
+              elif [[ "$node" =~ ^ss://([^:]+):([0-9]+)@([^:]+):([0-9]+) ]]; then
+                # uncommon pattern, fallback
+                host="${BASH_REMATCH[3]}"; port="${BASH_REMATCH[4]}"
+              elif [[ "$node" =~ ^ss://(.+)$ ]]; then
+                safe=$(echo "${BASH_REMATCH[1]}" | tr '-_' '+/')
+                pad=$(( ${#safe} % 4 ))
+                if [ $pad -ne 0 ]; then
+                  safe="${safe}$(printf '=%.0s' $(seq 1 $((4-pad))))"
+                fi
+                decoded=$(echo "$safe" | base64 -d 2>/dev/null || true)
+                if [[ "${decoded:-}" =~ @([^:]+):([0-9]+) ]]; then
+                  host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+                fi
+              fi
+            fi
+
+            # vless / trojan 简单匹配
+            if [[ -z "${host:-}" ]]; then
+              if [[ "$node" =~ ^(vless|trojan)://([^@]+@)?([^:]+):([0-9]+) ]]; then
+                host="${BASH_REMATCH[3]}"; port="${BASH_REMATCH[4]}"
+              fi
+            fi
+
+            if [ -n "${host:-}" ] && [ -n "${port:-}" ]; then
+              # try TCP connect
+              timeout ${TCP_TIMEOUT} bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null && echo "$node"
+            fi
+          }
+          export -f detect
+
+          # run detection with xargs parallel
+          cat to_detect.txt | xargs -r -P ${TCP_CONCURRENCY} -I {} bash -c 'detect "$@"' _ {} > ok.txt || true
+          available=$(wc -l < ok.txt 2>/dev/null || echo 0)
+          echo "✅ 通过端口检测的节点数: $available"
+
+          if [ "$available" -eq 0 ]; then
+            echo "⚠️  无节点通过端口检测，保留历史（如果有）"
+            if [ -s existing.txt ]; then
+              cp existing.txt ok.txt
+            else
+              echo "No available nodes." > "$GITHUB_WORKSPACE/sub.txt"
+              cd "$GITHUB_WORKSPACE" || true
+              rm -rf "$TMP"
+              exit 0
+            fi
+          fi
+
+          # 延迟测速（对通过端口检测的节点进行 ping 测试）
+          echo "⚡ 开始延迟测速（并发 ${PING_CONCURRENCY}）..."
+          > speed.txt
+          measure() {
+            node="$1"
+            host=""
+            if [[ "$node" =~ ^vmess://(.+)$ ]]; then
+              payload="${BASH_REMATCH[1]}"
+              safe=$(echo "$payload" | tr '-_' '+/')
+              pad=$(( ${#safe} % 4 ))
+              if [ $pad -ne 0 ]; then safe="${safe}$(printf '=%.0s' $(seq 1 $((4-pad))))"; fi
+              decoded=$(echo "$safe" | base64 -d 2>/dev/null || true)
+              host=$(echo "$decoded" | python3 -c "import sys,json
+try:
+  d=json.load(sys.stdin)
+  print(d.get('add') or d.get('address') or d.get('host') or '')
+except:
+  print('')" 2>/dev/null || true)
+            elif [[ "$node" =~ ^(vless|trojan)://([^@]+@)?([^:]+):([0-9]+) ]]; then
+              host="${BASH_REMATCH[3]}"
+            elif [[ "$node" =~ ss://([^@]+)@([^:]+):([0-9]+) ]]; then
+              host="${BASH_REMATCH[2]}"
+            fi
+            if [ -z "${host:-}" ]; then
+              return
+            fi
+            # ping - get average RTT (may fail if ICMP blocked)
+            rtt=$(ping -c ${PING_COUNT} -W ${PING_WAIT} "$host" 2>/dev/null | awk -F'/' 'END{print $5}' )
+            if [ -n "${rtt:-}" ]; then
+              echo "$rtt $node"
+            else
+              # mark as unmeasured but keep (put large number so sort puts it at end)
+              echo "99999 $node"
+            fi
+          }
+          export -f measure
+
+          # run speed tests and sort by latency, keep top SPEED_TOP
+          cat ok.txt | xargs -r -P ${PING_CONCURRENCY} -I {} bash -c 'measure "$@"' _ {} | sort -n | head -n ${SPEED_TOP} | awk '{sub(/^[0-9]+\.?[0-9]*[[:space:]]+/,"",$0); print $0}' > speed.txt || true
+          speed_count=$(wc -l < speed.txt 2>/dev/null || echo 0)
+          echo "🏆 测速通过的最快节点数: $speed_count"
+
+          if [ "$speed_count" -eq 0 ]; then
+            echo "⚠️ 测速无结果，使用所有端口检测通过的节点代替。"
+            cp ok.txt speed.txt || true
+          fi
+
+          final_count=$(wc -l < speed.txt 2>/dev/null || echo 0)
+          echo "🎯 最终可用节点数: $final_count"
+
+          # 输出 sub.txt 到仓库根目录（Base64 编码）
+          if [ "$final_count" -gt 0 ]; then
+            base64 -w 0 speed.txt > "$GITHUB_WORKSPACE/sub.txt" || true
+          else
+            echo "No available nodes." > "$GITHUB_WORKSPACE/sub.txt"
+          fi
+
+          # 保留调试文件在工作区以便 upload
+          cp raw.txt uniq.txt merged.txt to_detect.txt ok.txt speed.txt "$GITHUB_WORKSPACE/" 2>/dev/null || true
+
+          cd "$GITHUB_WORKSPACE" || true
+          rm -rf "$TMP"
+          echo "✅ 订阅生成完成。"
+
+      - name: Upload debug artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpn-sub-debug
+          path: |
+            sub.txt
+            raw.txt
+            uniq.txt
+            merged.txt
+            to_detect.txt
+            ok.txt
+            speed.txt
+
+      - name: Commit & Push (use REPO_PAT if provided, fallback to GITHUB_TOKEN)
+        env:
+          REPO_PAT: ${{ secrets.REPO_PAT }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [ -s sub.txt ] && [ "$(head -c 20 sub.txt)" != "No available" ]; then
+            git add sub.txt || true
+            git commit -m "Full screening update $(date -u +'%Y-%m-%d %H:%M UTC')" || echo "No changes to commit"
+            if [ -n "${REPO_PAT:-}" ]; then
+              echo "Using REPO_PAT to push"
+              git remote set-url origin https://x-access-token:${REPO_PAT}@github.com/${{ github.repository }}.git
+              git push origin HEAD:main
+            else
+              echo "REPO_PAT not found, attempting to push with GITHUB_TOKEN"
+              git push origin HEAD:main || echo "Push failed — if protected branches or permissions block push, please add REPO_PAT secret or merge via PR."
+            fi
+            echo "✅ 推送完成（若无权限会提示）。"
+          else
+            echo "⏭️ 跳过提交（订阅为空或无变化）"
+          fi
